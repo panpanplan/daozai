@@ -448,8 +448,8 @@ pub struct FrameOut {
     pub expanded: bool,
     pub editing: bool,
     pub animating: bool,
-    /// 当前帧正在绘制翻页过渡。
-    pub page_transition: bool,
+    /// 展开、收起、翻页或内容滚动仍需逐帧交付。
+    pub interactive_transition: bool,
     pub repaint_after: std::time::Duration,
     pub cmds: Vec<Cmd>,
 }
@@ -756,6 +756,7 @@ pub struct App {
     slide: Spring,
     dots: [Spring; 11],
     wheel_delta: f32,
+    pub(crate) content_scroll: Option<(egui::Id, f32)>,
     wheel_at: f64,
     wheel_page_at: f64,
 
@@ -961,6 +962,7 @@ impl App {
             slide: Spring::new(0.0, 260.0, 0.92),
             dots: std::array::from_fn(|i| Spring::new(if i == initial_page { 16.0 } else { 4.0 }, 380.0, 0.86)),
             wheel_delta: 0.0,
+            content_scroll: None,
             wheel_at: -1.0,
             wheel_page_at: -1.0,
             drag_hot: false,
@@ -2186,6 +2188,7 @@ impl App {
             let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
             self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t,self.skin_palette());
         }
+        let previous_scroll=self.content_scroll.take();
         let mut page_transition=false;
         if reveal > 0.004 && !banner && !restoring_lyrics {
             let c = base.shifted(0.0, (1.0 - reveal) * -5.0).faded(reveal);
@@ -2269,18 +2272,24 @@ impl App {
             shapes
         });
         self.update_position_drag(&ctx,env,dt);
-        let transitioning = self.position_drag.is_some() || self.drag_glide.is_some() || !self.drag_lift.settled(1.0) || !self.drag_stretch.settled(1.0) || !self.w.settled(PW)
+        let scrolling=previous_scroll.zip(self.content_scroll).is_some_and(|((old_id,old_y),(id,y))| old_id==id && old_y!=y);
+        let resizing=!self.w.settled(PW) || !self.h.settled(self.expanded_height());
+        let shelf_scrolling=self.open && self.page==3 && self.shelf_tab==0 && !self.shelf.items.is_empty()
+            && (self.shelf_scroll.target!=self.shelf_first as f32 || !self.shelf_scroll.settled(1.0)
+                || self.shelf_x.values().any(|s|!s.settled(68.0)));
+        let pet_fading=self.pet_a>0.001 && self.pet_a<0.999;
+        let resident_moving=!self.resident.settled();
+        let closing_tail=!self.open && (resident_moving || (!minimal_pill && pet_fading));
+        let interactive_transition=closing_tail || resizing || page_transition || scrolling || shelf_scrolling;
+        let transitioning = interactive_transition || self.position_drag.is_some() || self.drag_glide.is_some() || !self.drag_lift.settled(1.0) || !self.drag_stretch.settled(1.0)
             || self.center_guide>0.002 || self.center_lock_a>0.002 || self.t-self.center_lock_at<CENTER_SWEEP
-            || !self.h.settled(self.expanded_height())
             || self.page_e() < 0.7
             || self.dots.iter().any(|d| !d.settled(16.0))
             || self.hover_since.is_some() && !self.open
             || self.leave_since.is_some()
             || (self.drag_a > 0.001 && self.drag_a < 0.999)
             || self.drag_hot
-            || (self.pet_a > 0.001 && self.pet_a < 0.999)
-            || !self.resident.settled()
-            || self.open && self.page==3 && self.shelf_x.values().any(|s| !s.settled(68.0))
+            || pet_fading || resident_moving
             || self.open && self.page==2 && (!self.water_ring.settled(1.0) || !self.sit_view_t.settled(1.0) || !self.sit_t.settled(1.0))
             || self.toast.is_some()
             || self.t < self.notification_bell_until && self.t-self.notification_bell_at < 0.95
@@ -2322,7 +2331,7 @@ impl App {
             expanded: self.open,
             editing: self.is_editing(),
             animating,
-            page_transition,
+            interactive_transition,
             repaint_after,
             cmds,
         }
@@ -2406,9 +2415,10 @@ impl App {
             let inset=self.unread_top_inset();
             let height=self.unread_capsule_height(full.height()-inset);
             let left=self.dock()==model::Dock::Right || self.dock()==model::Dock::Top && full.right()+UNREAD_GAP+UNREAD_W>bounds.right();
-            let width=UNREAD_W*appear;
-            let x=if left {panel.left()-UNREAD_GAP*appear-width}else{panel.right()+UNREAD_GAP*appear};
-            return Some(Rect::from_min_size(Pos2::new(x,panel.top()+inset),Vec2::new(width,height*appear)));
+            // 胶囊在展开后的中心原地显现，避免跟着岛体边缘越过终点再弹回来。
+            let cx=if left {full.left()-UNREAD_GAP-UNREAD_W/2.0}else{full.right()+UNREAD_GAP+UNREAD_W/2.0};
+            let center=Pos2::new(cx,full.top()+inset+height/2.0);
+            return Some(Rect::from_center_size(center,Vec2::new(UNREAD_W,height)*appear));
         }
         // 极简刘海：横幅照常弹出，收起后只留细线，未读不常挂在线条上；展开岛体时在面板旁出现。
         if self.effective_minimal(){return None;}

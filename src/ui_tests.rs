@@ -1166,7 +1166,7 @@ struct H {
     region:Rect,
     hit:Rect,
     animating:bool,
-    page_transition:bool,
+    interactive_transition:bool,
     shapes:Vec<egui::epaint::ClippedShape>,
     bt: Vec<crate::bt::Device>,
     peripherals: Vec<crate::logitech::Device>,
@@ -1189,7 +1189,7 @@ impl H {
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
         let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
-        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,page_transition:false,shapes:Vec::new(), bt:Vec::new(),peripherals:Vec::new(),peripherals_ready:false,media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
+        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,interactive_transition:false,page_transition:false,shapes:Vec::new(), bt:Vec::new(),peripherals:Vec::new(),peripherals_ready:false,media:Default::default(),power:(None,false),network:None,system_idle:None,screen_locked:false,fullscreen:false,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
         self.t += 1.0 / 60.0;
@@ -1227,13 +1227,13 @@ impl H {
         let region=&mut self.region;
         let hit=&mut self.hit;
         let animating=&mut self.animating;
-        let page_transition=&mut self.page_transition;
+        let interactive_transition=&mut self.interactive_transition;
         let app = &mut self.app;
         let file_drop_zone=&mut self.file_drop_zone;
         let output = self.ctx.run(raw, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 let win = Rect::from_min_size(ui.max_rect().min,Vec2::new(WIN_W,WIN_H));
-                let frame=app.frame(ui, win, &env);*region=frame.region;*hit=frame.hit;*animating=frame.animating;*page_transition=frame.page_transition;*file_drop_zone=frame.file_drop_zone;cmds.extend(frame.cmds);
+                let frame=app.frame(ui, win, &env);*region=frame.region;*hit=frame.hit;*animating=frame.animating;*interactive_transition=frame.interactive_transition;*file_drop_zone=frame.file_drop_zone;cmds.extend(frame.cmds);
             });
         });
         self.shapes=output.shapes;
@@ -2657,6 +2657,11 @@ fn wheel_scrolls_lists_only_inside_content_and_respects_edges(){
         h.wheel(-40.0);
         assert_eq!(h.app.page,page,"有更多内容时应先滚动列表");
         assert_eq!(if page==3 {h.app.shelf_first}else{h.app.todo_first},1);
+        if page==3 {
+            for _ in 0..10 {h.frame(vec![]);assert!(h.interactive_transition);}
+            for _ in 0..90 {h.frame(vec![]);}
+            assert!(!h.interactive_transition,"置物架停稳后应降帧");
+        }
         h.hover(H::local(300.0,60.0),0.25);h.wheel(-40.0);
         assert_eq!(h.app.page,page,"内容溢出时滚到底也应留在本页");
         h.app.show_page(page);h.hover(H::local(210.0,18.0),0.3);h.wheel(-40.0);
@@ -2731,21 +2736,87 @@ fn wheel_clipboard_stays_at_both_edges() {
     }
 }
 #[test]
+fn hover_morph_keeps_interactive_frames_after_input_stops() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    for cursor in [Some(Pos2::new(WIN_W/2.0,12.0)),None] {
+        h.cursor=cursor;
+        let mut moving=0;
+        for _ in 0..120 {
+            let before=h.app.progress();
+            h.frame(vec![]);
+            if (h.app.progress()-before).abs()>0.005 {
+                assert!(h.interactive_transition,"岛体仍在运动时应逐帧显示");
+                moving+=1;
+            }
+        }
+        assert!(moving>4);
+        assert!(!h.interactive_transition,"停稳后恢复闲置刷新");
+    }
+}
+
+#[test]
+fn collapse_readback_covers_the_returning_pet_then_goes_idle() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.set_pet(true);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.5);
+    assert!(h.app.debug_state().1);
+    h.cursor=None;
+    for _ in 0..60 {
+        h.frame(vec![]);
+        if !h.app.debug_state().1 {break;}
+    }
+    assert!(!h.app.debug_state().1);
+    for _ in 0..36 {h.frame(vec![]);}
+    assert!(h.interactive_transition,"收起后宠物还在淡入，读回应保持交互节奏");
+    for _ in 0..90 {h.frame(vec![]);}
+    assert!(!h.interactive_transition,"宠物淡入结束后应恢复闲置节奏");
+}
+
+#[test]
+fn wheel_between_different_heights_keeps_the_unread_bubble_in_place() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.visible_pages.fill(true);
+    h.app.settings.wechat_notifications=true;
+    h.app.receive_wechat_reminder();
+    h.app.alerts.clear();
+    h.app.notice=None;
+    h.app.show_page(crate::app::QUOTA_PAGE);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.2);
+    h.hover(H::local(210.0,18.0),0.4);
+    let id=egui::Id::new(("card",true,"微信"));
+    let center=h.ctx.read_response(id).unwrap().rect.center();
+    let height=h.app.expanded_height();
+    for (delta,page) in [(-40.0,crate::app::CALENDAR_PAGE),(40.0,crate::app::QUOTA_PAGE)] {
+        h.wheel(delta);
+        assert_eq!(h.app.page,page);
+        if delta<0.0 {assert_ne!(h.app.expanded_height(),height);}
+        for _ in 0..60 {
+            let pos=h.ctx.read_response(id).unwrap().rect.center();
+            assert!(pos.distance(center)<0.1,"切页时消息气泡发生位移：{center:?} → {pos:?}");
+            h.frame(vec![]);
+        }
+    }
+}
+
+#[test]
 fn wheel_page_transition_keeps_interactive_frames_after_input_stops() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
     let mut h=H::new();
     h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);
     h.hover(H::local(210.0,18.0),0.3);
-    assert!(!h.page_transition);
+    assert!(!h.interactive_transition);
     h.wheel(-40.0);
     assert_eq!(h.app.page,1);
-    assert!(h.page_transition);
+    assert!(h.interactive_transition);
     for _ in 0..18 {
         h.frame(vec![]);
-        assert!(h.page_transition,"松开滚轮后，仍然可见的翻页动画应继续逐帧显示");
+        assert!(h.interactive_transition,"松开滚轮后，仍然可见的翻页动画应继续逐帧显示");
     }
     for _ in 0..24 {h.frame(vec![]);}
-    assert!(!h.page_transition,"翻页结束后应恢复原刷新策略");
+    assert!(!h.interactive_transition,"翻页结束后应恢复原刷新策略");
 }
 
 #[test]
@@ -5904,6 +5975,11 @@ fn mailbox_scroll_reaches_older_mail_without_changing_pages() {
     h.app.mail.recent=(1..=8).map(|uid|crate::mail::Item {received_unix: None, account:"test@qq.com".into(),from:format!("来源 {uid}"),subject:format!("邮件 {uid}"),time:"11-03 09:41".into(),code:Some(format!("{uid:06}")),html: String::new().into(), summary:String::new().into(),links:vec![],meeting:None,uid}).collect();
     for item in h.app.mail.recent.clone(){h.app.mail.privacy.observe(&item,true,h.app.t,chrono::Utc::now().timestamp());}
     h.app.show_page(5);h.hover(H::local(200.0,90.0),1.0);
+    h.frame(vec![egui::Event::MouseWheel{unit:egui::MouseWheelUnit::Line,delta:egui::vec2(0.0,-1.0),modifiers:Default::default()}]);
+    h.frame(vec![]);
+    assert!(h.interactive_transition,"滚轮松开后内容仍在平滑滚动");
+    for _ in 0..60 {h.frame(vec![]);}
+    assert!(!h.interactive_transition,"列表停稳后恢复闲置刷新");
     h.frame(vec![egui::Event::MouseWheel{unit:egui::MouseWheelUnit::Point,delta:egui::vec2(0.0,-900.0),modifiers:Default::default()}]);
     h.hover(H::local(200.0,90.0),0.6);
     assert_eq!(h.app.page(),5,"滚动邮箱列表不能切换页面");
@@ -7974,6 +8050,39 @@ fn messenger_notifications_keep_separate_badges_until_the_client_is_viewed(){
     h.app.receive_wechat_reminder();h.app.receive_wechat_reminder();
     assert_eq!(sources(&h),[Messenger::Wechat]);
     h.app.settings.wechat_notifications=false;h.frame(vec![]);assert!(h.app.pending_messengers.is_empty());
+}
+
+#[test]
+fn unread_capsule_center_stays_put_as_the_island_springs_open() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dock in crate::model::Dock::ALL {
+        let mut h=H::new();
+        h.app.settings.dock=dock;
+        h.app.settings.wechat_notifications=true;
+        h.app.receive_wechat_reminder();
+        h.app.alerts.clear();
+        h.app.notice=None;
+        let win=Rect::from_min_size(Pos2::ZERO,Vec2::new(WIN_W,WIN_H));
+        h.cursor=Some(match dock {
+            crate::model::Dock::Top=>win.center_top()+Vec2::new(0.0,12.0),
+            crate::model::Dock::Left=>win.left_center()+Vec2::new(8.0,0.0),
+            crate::model::Dock::Right=>win.right_center()-Vec2::new(8.0,0.0),
+        });
+        let id=egui::Id::new(("card",true,"微信"));
+        let mut centers=Vec::new();
+        for _ in 0..90 {
+            h.frame(vec![]);
+            if let Some(button)=h.ctx.read_response(id) {
+                if h.app.open && button.rect.width()>crate::app::UNREAD_W-0.1 {
+                    centers.push(button.rect.center());
+                }
+            }
+        }
+        assert!(centers.len()>30,"{dock:?} 应采集到完整展开后的按钮");
+        let end=*centers.last().unwrap();
+        let drift=centers.iter().map(|p|p.distance(end)).fold(0.0_f32,f32::max);
+        assert!(drift<0.1,"{dock:?} 未读图标展开后又移动了 {drift:.2} 个逻辑像素");
+    }
 }
 
 #[test]

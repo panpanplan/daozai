@@ -20,6 +20,8 @@ struct Shell {
     /// 兼容渲染上一次请求读回画面的时刻（无输入的持续动画按约 30 帧/秒读回）。
     #[cfg(windows)]
     readback_at: Option<Instant>,
+    #[cfg(windows)]
+    was_interactive_transition: bool,
     media: smtc::Shared,
     seek_rx: Option<(&'static str,std::sync::mpsc::Receiver<bool>)>,
     media_control:Option<smtc::ControlWorker>,
@@ -197,6 +199,8 @@ impl Shell {
             frame_at: Instant::now(),
             #[cfg(windows)]
             readback_at: None,
+            #[cfg(windows)]
+            was_interactive_transition: false,
             media,
             seek_rx: None,
             media_control:None,
@@ -680,16 +684,18 @@ impl eframe::App for Shell {
                     i.events.iter().any(|e|!matches!(e,egui::Event::Screenshot{..})),
                 ));
                 let changed=shot.as_ref().is_some_and(|image|native.present_frame(image.size,image.as_raw()));
-                let turning=out.page_transition && !self.hidden;
-                let interactive=other_input || turning;
+                let moving=!self.hidden && out.interactive_transition;
+                let previous=std::mem::replace(&mut self.was_interactive_transition,moving);
+                let capture_transition=moving || (previous && !self.hidden);
+                let interactive=other_input || capture_transition;
                 if shot.is_none() || changed || interactive {
-                    // 翻页期间即使滚轮已经停下，也要交付当前帧；持续动效仍按自身的低频节奏读回。
+                    // 交互结束后仍交付动画及其停稳的一帧；持续动效仍按自身的低频节奏读回。
                     let now=Instant::now();
                     match daozai::layered::readback_delay(self.readback_at,now,interactive,out.repaint_after) {
                         None=>{
                             self.readback_at=Some(now);
-                            let data=if turning && self.app.render_compat_running {
-                                egui::UserData::new(eframe::InteractiveCapture(self.frame_at+out.repaint_after))
+                            let data=if capture_transition && self.app.render_compat_running {
+                                egui::UserData::new(eframe::InteractiveCapture(self.frame_at+Duration::from_secs_f64(1.0/60.0)))
                             } else {Default::default()};
                             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(data));
                         }
@@ -855,7 +861,7 @@ impl eframe::App for Shell {
         self.app.mail_reader_ui(ctx);
         // 翻页以帧起点为准，扣掉本帧已花的时间；入口处的限帧仍然生效。
         #[cfg(windows)] let repaint_after=if self.hidden {Duration::from_secs(1)}
-            else if out.page_transition {out.repaint_after.saturating_sub(self.frame_at.elapsed())}
+            else if out.interactive_transition {out.repaint_after.saturating_sub(self.frame_at.elapsed())}
             else {out.repaint_after};
         #[cfg(not(windows))] let repaint_after=out.repaint_after;
         schedule_repaint(ctx,repaint_after);

@@ -1151,7 +1151,7 @@ impl App {
         content.set_opacity(c.painter.opacity());if !c.live{content.disable();}
         content.spacing_mut().item_spacing.y=0.0;content.spacing_mut().scroll.floating=false;content.spacing_mut().scroll.bar_width=4.0*c.s;
         content.visuals_mut().widgets.inactive.bg_fill=Color32::from_gray(80);
-        egui::ScrollArea::vertical().id_salt(("mail-list-scroll",trash,self.mail.manage.unread_only)).max_height(list_bounds.height()*c.s).auto_shrink([false,false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show_rows(&mut content,row_h*c.s,indices.len(),|ui,range|{
+        let scroll=egui::ScrollArea::vertical().id_salt(("mail-list-scroll",trash,self.mail.manage.unread_only)).max_height(list_bounds.height()*c.s).auto_shrink([false,false]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show_rows(&mut content,row_h*c.s,indices.len(),|ui,range|{
             let rows:Vec<_>=range.map(|i|self.mail_rows()[indices[i]].clone()).collect();
             for raw in rows{
                 let item=self.display_mail(&raw);let hidden=self.mail_code_hidden(&raw);let seen=self.mail_seen(&raw,folder);
@@ -1190,6 +1190,7 @@ impl App {
                 if hit.clicked()&&!acted{self.mail_open(&raw);}
             }
         });
+        if c.live {self.content_scroll=Some((scroll.id,scroll.state.offset.y));}
     }
 
     /// 岛内邮件详情可滚动，也可以进入独立窗口阅读全文。
@@ -1239,7 +1240,7 @@ impl App {
         content.spacing_mut().item_spacing.y=6.0*c.s;
         content.style_mut().spacing.scroll.floating=false;
         content.spacing_mut().scroll.bar_width=4.0*c.s;
-        egui::ScrollArea::vertical().id_salt(("mail-body",&item.account,item.uid)).max_height(90.0*c.s).auto_shrink([false,false]).show(&mut content,|ui|{
+        let scroll=egui::ScrollArea::vertical().id_salt(("mail-body",&item.account,item.uid)).max_height(90.0*c.s).auto_shrink([false,false]).show(&mut content,|ui|{
             if !body.is_empty() {
                 crate::mail_reader::body_ui(ui,body.as_ref(),11.5*c.s);
             }else if item.links.is_empty(){
@@ -1252,6 +1253,7 @@ impl App {
                 }
             }
         });
+        if c.live {self.content_scroll=Some((scroll.id,scroll.state.offset.y));}
 
         if !self.mail.manage.message.is_empty(){
             c.text(46.0,229.0,&c.fit(&self.mail.manage.message,8.0,W::Regular,130.0),8.0,W::Regular,theme::GRAY,H::Left);
