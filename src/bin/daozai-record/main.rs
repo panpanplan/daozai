@@ -450,10 +450,13 @@ fn main() {
             volume: Some((62, false)),
             bt: Vec::new(),
             bt_ready: true,
+            peripherals: Vec::new(),
+            peripherals_ready: true,
             screen: None,
             backdrop: None,
             glass_blur: false,
             opaque_surface: false,
+            performance: None,
         };
 
         let mut vp = egui::ViewportInfo::default();

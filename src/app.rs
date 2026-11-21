@@ -34,7 +34,12 @@ pub const MAIL_PAGE: usize = 5;
 pub const QUOTA_PAGE: usize = 6;
 pub const CALENDAR_PAGE: usize = 7;
 pub const WEATHER_PAGE: usize = 8;
+pub const LOGITECH_PAGE: usize = 9;
+/// 电脑状态页：CPU、内存、硬盘占用与实时网速。
+pub const PERF_PAGE: usize = 10;
 pub(crate) const WEATHER_H: f32 = 232.0;
+/// 电脑状态页比普通页高，容纳四张指标卡与趋势线。
+pub(crate) const PERF_H: f32 = 200.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
 pub const BAR_H: f32 = 30.0; // 收起药丸高
@@ -78,8 +83,8 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 9] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气"];
-pub(crate) const PAGE_SETTINGS_TABS: [usize; 9] = [1,2,3,5,4,7,11,8,12];
+pub(crate) const PAGE_NAMES: [&str; 11] = ["音乐", "专注", "健康", "置物架", "待办", "邮箱", "AI 额度", "日程", "天气", "外设电量", "电脑状态"];
+pub(crate) const PAGE_SETTINGS_TABS: [usize; 11] = [1,2,3,5,4,7,11,8,12,15,16];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -140,6 +145,9 @@ pub struct Env {
     pub bt: Vec<crate::bt::Device>,
     /// 蓝牙服务是否已经完成首次扫描。
     pub bt_ready: bool,
+    /// 经罗技接收器连接的鼠标、键盘及电量。
+    pub peripherals: Vec<crate::logitech::Device>,
+    pub peripherals_ready: bool,
     /// 岛所在屏幕（与 `win` 同一坐标系，逻辑点）；用于让通知详情留在屏幕内。
     pub screen: Option<Rect>,
     /// 毛玻璃皮肤：岛体四周采样得到的背景色（sRGB 0..1）。
@@ -148,6 +156,8 @@ pub struct Env {
     pub glass_blur: bool,
     /// 不支持逐像素透明的兼容后端需要按内容轮廓裁剪窗口。
     pub opaque_surface: bool,
+    /// 最近一次电脑性能采样（CPU / 内存 / 硬盘 / 网速）。
+    pub performance: Option<crate::performance::Snapshot>,
 }
 
 impl Env {
@@ -744,7 +754,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 9],
+    dots: [Spring; 11],
     wheel_delta: f32,
     wheel_at: f64,
     wheel_page_at: f64,
@@ -879,6 +889,9 @@ pub struct App {
     /// 上一次看到的蓝牙设备，用来只在连接/断开时提示一次。
     pub(crate) bt_shown: Vec<crate::bt::Device>,
     bt_initialized: bool,
+    /// 上一次看到的罗技外设，用于低电量和充电状态提醒。
+    pub(crate) peripherals_shown: Vec<crate::logitech::Device>,
+    peripherals_initialized: bool,
     /// v0.5.5：邮件账号、最近邮件与设置表单。
     pub(crate) mail: MailState,
     /// 岛内详情与独立阅读窗口各保留一份排版缓存。
@@ -890,6 +903,8 @@ pub struct App {
     pub(crate) weather: crate::weather::State,
     pub(crate) weather_source: crate::weather_source_ui::State,
     pub(crate) updates: crate::updates::State,
+    /// 电脑状态页与常驻徽标共用的最近一次采样。
+    pub(crate) performance: Option<crate::performance::Snapshot>,
     pub(crate) resident: bar::Motion,
     pub(crate) resident_power: (Option<u8>,bool),
 }
@@ -918,6 +933,7 @@ impl App {
             opts,
             render_compat_running: settings.render_compat,
             settings,
+            performance: None,
             todos: model::TodoList::load(),
             water: model::Water::default(),
             shelf: model::Shelf::load(),
@@ -1016,6 +1032,8 @@ impl App {
             music_restart_at: None,
             bt_shown: Vec::new(),
             bt_initialized: false,
+            peripherals_shown: Vec::new(),
+            peripherals_initialized: false,
             mail: MailState { accounts: mail::load_accounts(), ..Default::default() },
             mail_lines_cache: Vec::new(),
             calendar: CalendarState::load(),
@@ -1487,13 +1505,14 @@ impl App {
         }
     }
 
-    /// v0.5.4：把系统音量与蓝牙设备状态同步进界面；只在连接/断开时提示一次。
+    /// 把系统音量与外设状态同步进界面；重复轮询不会重复提醒。
     fn sync_device(&mut self, env: &Env) {
         if self.t >= self.volume_quiet_until {
             if let Some(v) = env.volume {
                 self.volume_ui = Some(v);
             }
         }
+        self.sync_peripherals(env);
         if !self.settings.bluetooth_notifications {
             self.bt_shown.clear();
             self.bt_initialized=false;
@@ -1513,6 +1532,34 @@ impl App {
         for device in &connected { self.bluetooth_alert(device, true); }
         for device in &disconnected { self.bluetooth_alert(device, false); }
         self.bt_shown = env.bt.clone();
+    }
+
+    /// 罗技外设低电量与充电状态提醒：首扫只提醒低电量，之后仅在状态变化时提醒。
+    fn sync_peripherals(&mut self, env: &Env) {
+        if !self.module_on(LOGITECH_PAGE) {
+            self.peripherals_shown.clear();
+            self.peripherals_initialized=false;
+            self.alerts.retain(|a|a.title!="外设电量");
+            if self.notice.as_ref().is_some_and(|a|a.title=="外设电量") {self.notice=None;}
+            if self.hud_notice.as_ref().is_some_and(|a|a.title=="外设电量") {self.hud_notice=None;}
+            return;
+        }
+        if !env.peripherals_ready { return; }
+        let first=!self.peripherals_initialized;
+        for device in &env.peripherals {
+            let previous=self.peripherals_shown.iter().find(|old|old.id==device.id);
+            let low=device.battery.is_some_and(|level|level<=20) && !device.charging;
+            let became_low=low && previous.is_none_or(|old|old.battery.is_none_or(|level|level>20) || old.charging);
+            if became_low && (first || previous.is_some()) {
+                self.peripheral_alert(device,true);
+            } else if !first {
+                if let Some(old)=previous.filter(|old|old.charging!=device.charging && device.battery.is_some()) {
+                    if device.charging || old.charging { self.peripheral_alert(device,false); }
+                }
+            }
+        }
+        self.peripherals_shown=env.peripherals.clone();
+        self.peripherals_initialized=true;
     }
 
     /// 距离上次交互的秒数（小精灵出现的依据）。
@@ -1809,7 +1856,7 @@ impl App {
     }
 
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==PERF_PAGE {PERF_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
     }
 
     // ---------------------------------------------------------------
@@ -1827,6 +1874,7 @@ impl App {
         self.fullscreen_hidden=env.fullscreen_hidden;
         self.quota_tick();
         self.weather_tick();
+        self.performance=env.performance.clone();
         self.current_hour=env.hour();
         self.system_idle=env.idle_seconds;
         self.dt = dt;
@@ -1869,7 +1917,7 @@ impl App {
         self.update_media(env,&ctx);
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         self.resident_power=(env.battery,env.charging);
-        let mut layout=Layout::new(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some());
+        let mut layout=Layout::with_perf(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some(),self.settings.show_performance&&self.performance.is_some());
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -2992,6 +3040,7 @@ impl App {
             let c=base.faded(compact_alpha);let c=if compact_alpha<0.8{c.ghost()}else{c};
             self.draw_quota_bar(&c,local_cx,&layout);
             if let Some(x)=layout.x[bar::WEATHER] { self.draw_pill_weather(&c,local_cx+x,&layout); }
+            if let Some(x)=layout.x[bar::PERF] { self.draw_pill_performance(&c,local_cx+x,&layout); }
         }
         if self.pomo.running && compact_alpha>0.004 {
             crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+layout.x[bar::FOCUS].unwrap(),15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);
@@ -3096,6 +3145,8 @@ impl App {
             6 => ("AI", "额度", theme::SOFT_GREEN),
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
+            LOGITECH_PAGE => ("外设", "电量", theme::SOFT_GREEN),
+            PERF_PAGE => ("电脑", "状态", theme::BLUE),
             _ => ("岛仔", "设置", theme::WHITE),
         };
         let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
@@ -3107,7 +3158,7 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        let arrow_y=if self.page==6||self.page==8{88.0}else{68.0};
+        let arrow_y=if self.page==6||self.page==8{88.0}else if self.page==PERF_PAGE{94.0}else{68.0};
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3154,6 +3205,8 @@ impl App {
             5 => self.page_mail(c, env, cmds),
             6 => self.page_quota(c),
             8 => self.page_weather(c,env,cmds),
+            LOGITECH_PAGE => self.page_logitech(c,env),
+            PERF_PAGE => self.page_performance(c,env),
             CALENDAR_PAGE => self.page_calendar(c,env),
             _ => self.page_settings(c),
         }

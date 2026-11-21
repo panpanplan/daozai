@@ -54,14 +54,15 @@ impl Alert {
             _=>None,
         }
     }
-    pub(crate) fn is_hud(&self)->bool {self.source==AlertSource::Internal && matches!(self.title.as_str(),"系统音量"|"大写锁定"|"键盘输入语言"|"网络连接"|"电源已连接"|"已切换电池供电"|"蓝牙设备")}
+    pub(crate) fn is_hud(&self)->bool {self.source==AlertSource::Internal && matches!(self.title.as_str(),"系统音量"|"大写锁定"|"键盘输入语言"|"网络连接"|"电源已连接"|"已切换电池供电"|"蓝牙设备"|"外设电量")}
 }
 fn bluetooth_notice_content(body:&str)->(&str,&str,Option<u8>){
     if let Some(name)=body.strip_suffix(" · 已断开") {return (name,"已断开",None);}
     if body=="已断开连接" {return ("蓝牙设备","已断开",None);}
     if let Some((name,level))=body.rsplit_once(" · 电量 ") {
+        let (level,status)=level.split_once(" · ").map_or((level,"已连接"),|(level,status)|(level,status));
         if let Some(level)=level.strip_suffix('%').and_then(|s|s.parse::<u8>().ok()).filter(|v|*v<=100){
-            return (name,"已连接",Some(level));
+            return (name,status,Some(level));
         }
     }
     (body,"已连接",None)
@@ -89,8 +90,8 @@ pub(crate) fn device_icon(c: &Card, kind: crate::bt::DeviceKind, x: f32, y: f32,
 pub(crate) use crate::pet::PetState;
 
 pub(crate) fn notice_badge(c:&Card,x:f32,y:f32,a:&Alert){
-    if a.source==AlertSource::Internal && a.title=="蓝牙设备"{
-        c.circle(x,y,11.0,if a.body.contains("已断开"){Color32::from_gray(95)}else{theme::BLUE});
+    if a.source==AlertSource::Internal && matches!(a.title.as_str(),"蓝牙设备"|"外设电量"){
+        c.circle(x,y,11.0,if a.body.contains("已断开"){Color32::from_gray(95)}else if a.body.contains("电量偏低"){theme::RED}else{theme::BLUE});
         device_icon(c,a.bluetooth.map_or(crate::bt::DeviceKind::Other,|v|v.0),x-7.5,y-7.5,15.0);
     }else{notice_icon(&c.scaled(x,y,0.85),x,y,a);}
 }
@@ -244,7 +245,7 @@ impl App {
         }
         let transient = matches!(
             title.as_str(),
-            "系统音量" | "大写锁定" | "键盘输入语言" | "网络连接" | "电源已连接" | "已切换电池供电" | "蓝牙设备"
+            "系统音量" | "大写锁定" | "键盘输入语言" | "网络连接" | "电源已连接" | "已切换电池供电" | "蓝牙设备" | "外设电量"
         );
         let a = Alert {
             source: AlertSource::Internal,
@@ -282,6 +283,24 @@ impl App {
             unread: None,
         };
         self.enqueue_alert(a, false);
+    }
+    /// 罗技外设电量提醒：低电量（low=true）或充电状态变化时在收起的岛上提示。
+    pub(crate) fn peripheral_alert(&mut self, device: &crate::logitech::Device, low: bool) {
+        if !self.module_on(crate::app::LOGITECH_PAGE) { return; }
+        let mut body=device.summary();
+        if low { body.push_str(" · 电量偏低"); }
+        else if !device.charging { body.push_str(" · 已停止充电"); }
+        self.enqueue_alert(Alert{
+            source:AlertSource::Internal,
+            title:"外设电量".into(),
+            body,
+            page:crate::app::LOGITECH_PAGE,
+            at:self.t,
+            duration:if low {5.0}else{2.5},
+            bluetooth:Some((device.kind,true)),
+            meeting:None,
+            unread:None,
+        },false);
     }
     fn enqueue_alert(&mut self, a: Alert, system: bool) {
         // 通知仅保存在本次运行的内存中。
@@ -498,9 +517,9 @@ impl App {
             return;
         }
         if a.is_hud(){
-            if a.title=="蓝牙设备" {
+            if matches!(a.title.as_str(),"蓝牙设备"|"外设电量") {
                 let (name,status,battery)=bluetooth_notice_content(&a.body);
-                nc.circle(26.0,24.0,14.0,if status=="已连接"{Color32::from_rgb(10,132,255)}else{Color32::from_gray(95)});
+                nc.circle(26.0,24.0,14.0,if status=="电量偏低"{theme::RED}else if status=="已连接"||status=="充电中"{Color32::from_rgb(10,132,255)}else{Color32::from_gray(95)});
                 let kind=a.bluetooth.map(|(kind,_)|kind).unwrap_or(crate::bt::DeviceKind::Other);
                 device_icon(&nc,kind,17.0,15.0,18.0);
                 let right=HUD_W-14.0;
@@ -736,7 +755,7 @@ mod tests {
 
     #[test]
     fn settings_groups_keep_every_page_reachable() {
-        let groups = ["通用", "音乐", "专注与健康", "专注与健康", "待办与置物", "待办与置物", "消息提醒", "邮箱", "日程", "关于", "页面管理", "AI 额度", "天气", "外观", "位置"];
+        let groups = ["通用", "音乐", "专注与健康", "专注与健康", "待办与置物", "待办与置物", "消息提醒", "邮箱", "日程", "关于", "页面管理", "AI 额度", "天气", "外观", "位置", "外设电量", "电脑状态"];
         for (tab, expected) in groups.iter().enumerate() {
             let matches: Vec<_> = SETTINGS_GROUPS.iter().filter(|(_,start,end,_)| (*start..=*end).contains(&tab)).collect();
             assert_eq!(matches.len(), 1, "页面 {tab} 必须且只能属于一个分组");
@@ -1260,6 +1279,8 @@ fn settings_page_icon(page:usize)->egui::ImageSource<'static>{
         MAIL_PAGE=>("mail",include_bytes!("../assets/settings-icons/system/mail.svg")),
         QUOTA_PAGE=>("quota",include_bytes!("../assets/settings-icons/system/quota.svg")),
         CALENDAR_PAGE=>("calendar",include_bytes!("../assets/settings-icons/system/calendar.svg")),
+        LOGITECH_PAGE=>("logitech",include_bytes!("../assets/device-icons/keyboard-bold.svg")),
+        PERF_PAGE=>("performance",include_bytes!("../assets/settings-icons/system/general.svg")),
         _=>("weather",include_bytes!("../assets/settings-icons/system/weather.svg")),
     };
     egui::ImageSource::Bytes{uri:format!("bytes://settings-header-{name}.svg").into(),bytes:bytes.into()}
@@ -1269,7 +1290,7 @@ fn settings_page_icon(page:usize)->egui::ImageSource<'static>{
 #[cfg_attr(not(test),allow(dead_code))]
 pub(crate) fn settings_tab_module(tab:usize)->Option<usize>{
     use crate::app::*;
-    match tab {1=>Some(MUSIC_PAGE),2=>Some(FOCUS_PAGE),3=>Some(WATER_PAGE),4=>Some(TODO_PAGE),5=>Some(SHELF_PAGE),7=>Some(MAIL_PAGE),8=>Some(CALENDAR_PAGE),11=>Some(QUOTA_PAGE),12=>Some(WEATHER_PAGE),_=>None}
+    match tab {1=>Some(MUSIC_PAGE),2=>Some(FOCUS_PAGE),3=>Some(WATER_PAGE),4=>Some(TODO_PAGE),5=>Some(SHELF_PAGE),7=>Some(MAIL_PAGE),8=>Some(CALENDAR_PAGE),11=>Some(QUOTA_PAGE),12=>Some(WEATHER_PAGE),15=>Some(LOGITECH_PAGE),16=>Some(PERF_PAGE),_=>None}
 }
 
 pub(crate) fn settings_label(ui:&mut egui::Ui,text:&str){
@@ -1402,11 +1423,15 @@ fn setting_choices(ui:&mut egui::Ui,title:&str,value:&mut u32,values:[u32;3],uni
 /// 设置页分页序号。旧序号保持不变（岛上入口、测试都按序号跳转），新增外观与位置两页。
 pub(crate) const SETTINGS_TAB_APPEARANCE: usize = 13;
 pub(crate) const SETTINGS_TAB_POSITION: usize = 14;
+pub(crate) const SETTINGS_TAB_LOGITECH: usize = 15;
+pub(crate) const SETTINGS_TAB_PERFORMANCE: usize = 16;
 /// 侧栏：一项就是一页，不再有页内子标签。专注与健康（2、3）、待办与置物（4、5）各合成一页；关于固定左下角。
 /// 第四列是这一项之前的分组标题。
-const SETTINGS_GROUPS: [(&str,usize,usize,&str);13] = [
+const SETTINGS_GROUPS: [(&str,usize,usize,&str);15] = [
     ("通用",0,0,"岛仔"), ("外观",SETTINGS_TAB_APPEARANCE,SETTINGS_TAB_APPEARANCE,""), ("位置",SETTINGS_TAB_POSITION,SETTINGS_TAB_POSITION,""), ("页面管理",10,10,""),
     ("音乐",1,1,"功能"), ("专注与健康",2,3,""), ("待办与置物",4,5,""), ("消息提醒",6,6,""), ("邮箱",7,7,""), ("日程",8,8,""), ("AI 额度",11,11,""), ("天气",12,12,""),
+    ("外设电量",SETTINGS_TAB_LOGITECH,SETTINGS_TAB_LOGITECH,""),
+    ("电脑状态",SETTINGS_TAB_PERFORMANCE,SETTINGS_TAB_PERFORMANCE,""),
     ("关于",9,9,""),
 ];
 /// 分页标题；合并页（3→2、5→4）显示合并后的名字。
@@ -1532,6 +1557,30 @@ impl App {
                     // 右侧给滚动条留出空隙，卡片和开关不会被它压住。
                     ui.set_width((ui.available_width()-12.0).max(240.0));
                     match tab {
+                    SETTINGS_TAB_LOGITECH=>{
+                        self.settings_feature_header(ui,crate::app::LOGITECH_PAGE,"罗技鼠标、键盘电量与充电状态",|_,_|{});
+                        settings_label(ui,"读取方式");
+                        settings_card(ui,|ui|{
+                            ui.label("通过 Logi Bolt / Unifying 接收器直接读取，无需切换蓝牙，也不依赖 Options+ 数据库。");
+                            ui.add_space(5.0);
+                            ui.label("每 2 秒只读检测接收器插拔，打开「外设电量」页会立即读取一次，后台每分钟兜底刷新；偶尔读取失败会沿用上次电量，连续多次读不到才显示未知，设备名称始终保留。电量不高于 20% 及充电状态变化时，在收起的岛上提醒。");
+                        });
+                    }
+                    SETTINGS_TAB_PERFORMANCE=>{
+                        let on=self.settings_feature_header(ui,crate::app::PERF_PAGE,"CPU、内存、硬盘占用与实时网速",|_,_|{});
+                        settings_label(ui,"采集方式");
+                        settings_card(ui,|ui|{
+                            ui.label("每秒读取一次 Windows 系统计数器：CPU 时间差算占用率，物理内存与固定分区读取容量，网卡字节数差算上下行网速。");
+                            ui.add_space(5.0);
+                            ui.label("磁盘读写速率需要系统允许读取物理磁盘性能计数器；不提供时显示「—」，容量与占用仍可正常查看。所有数据只在本机内存里，不落盘、不联网。");
+                        });
+                        ui.add_enabled_ui(on,|ui|{
+                            settings_label(ui,"岛上显示");
+                            settings_card(ui,|ui|{
+                                setting_row(ui,"性能徽标","收起时显示 CPU 占用率，点击打开电脑状态页",&mut self.settings.show_performance);
+                            });
+                        });
+                    }
                     12=>{
                         let on=self.settings_feature_header(ui,crate::app::WEATHER_PAGE,"当地天气与七日预报",|_,_|{});
                         ui.add_space(4.0);
@@ -1555,13 +1604,15 @@ impl App {
                             ui.separator();
                             setting_row(ui,"天气","天气图标和温度，点击打开天气页",&mut self.settings.show_weather);
                             ui.separator();
+                            setting_row(ui,"电脑状态","收起时显示 CPU 占用率，点击打开电脑状态页",&mut self.settings.show_performance);
+                            ui.separator();
                             let before=self.quota.config.compact;
                             setting_row(ui,"AI 额度","常驻账号；WorkBuddy 积分在前，DeepSeek 余额在最后",&mut self.quota.config.compact);
                             if before!=self.quota.config.compact {self.quota.config.save();}
                         });
                         settings_label(ui,"功能页面");
                         settings_card(ui,|ui|{
-                            let descriptions=["播放控制与同步歌词","番茄钟与休息计时","喝水与久坐提醒","临时收纳文件位置","任务清单与到期提醒","邮件摘要与验证码","Agent 剩余额度和账号切换","月历、邮件邀请与工作日程","当地天气与七日预报"];
+                            let descriptions=["播放控制与同步歌词","番茄钟与休息计时","喝水与久坐提醒","临时收纳文件位置","任务清单与到期提醒","邮件摘要与验证码","Agent 剩余额度和账号切换","月历、邮件邀请与工作日程","当地天气与七日预报","罗技鼠标、键盘电量与充电状态","CPU、内存、硬盘占用与实时网速"];
                             ui.label(egui::RichText::new("拖动左侧手柄调整顺序；关闭的功能不在后台运行，不同步也不提醒，已有数据保留。").size(11.5).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             #[derive(Clone)]
                             struct PageDrag(usize);

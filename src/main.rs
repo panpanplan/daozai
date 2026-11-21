@@ -77,6 +77,16 @@ struct Shell {
     bt_rx: Option<daozai::bt::Service>,
     bt: Vec<daozai::bt::Device>,
     bt_ready: bool,
+    /// v0.6.67：罗技外设电量（HID++ 后台线程），模块关闭时清理并停止采集。
+    #[cfg(windows)]
+    logitech_rx: Option<daozai::logitech::Service>,
+    peripherals: Vec<daozai::logitech::Device>,
+    peripherals_ready: bool,
+    /// 外设页是否正显示：切到该页时向后台服务请求一次立即读取。
+    #[cfg(windows)]
+    logitech_page_shown: bool,
+    /// 电脑状态页或常驻徽标开启时运行的后台采样服务。
+    performance: Option<daozai::performance::Service>,
     volume_quiet: PollClock,
     /// v0.5.5：邮件收信服务（工作线程），以及上次同步给它的账号/开关快照。
     /// 邮箱模块开启时才存在；关闭后收信与整理线程随之退出。
@@ -102,6 +112,11 @@ impl Shell {
         if mail_on!=self.mail.is_some() {self.mail=mail_on.then(daozai::mail::Service::start);self.mail_sig=None;}
         let cal_on=self.app.module_on(app::CALENDAR_PAGE);
         if cal_on!=self.cal.is_some() {self.cal=cal_on.then(daozai::calendar::Service::start);self.cal_sig=None;}
+        // 页面与常驻徽标都关闭时彻底停掉采样线程，不留后台开销。
+        let perf_on=self.app.module_on(app::PERF_PAGE)||self.app.settings.show_performance;
+        if perf_on!=self.performance.is_some() {
+            self.performance=if perf_on {Some(daozai::performance::Service::start())}else{None};
+        }
         let clipboard_on=self.app.clipboard_active();
         if clipboard_on!=self.clipboard_watch.is_some() {
             self.clipboard_watch=if clipboard_on {let ctx=ctx.clone();daozai::clipboard::watch(self.app.clipboard.clone(),move||ctx.request_repaint())}else{None};
@@ -223,6 +238,12 @@ impl Shell {
             bt_rx: None,
             bt: Vec::new(),
             bt_ready: false,
+            logitech_rx: None,
+            peripherals: Vec::new(),
+            peripherals_ready: false,
+            #[cfg(windows)]
+            logitech_page_shown: false,
+            performance: None,
             volume_quiet: PollClock::default(),
             mail: None,
             mail_sig: None,
@@ -267,6 +288,9 @@ impl Shell {
     }
 
     fn env(&mut self, ctx: &egui::Context) -> Env {
+        // 新采样到了就请求一帧重绘；界面始终只读最近一次快照。
+        if self.performance.as_mut().and_then(|s|s.poll()).is_some() {ctx.request_repaint();}
+        let performance=self.performance.as_ref().and_then(|s|s.latest()).cloned();
         if let Some((source,rx))=&self.music_volume_rx {
             if let Ok(success)=rx.try_recv() {
                 if !success && self.media.lock().is_ok_and(|media|media.source==*source) {
@@ -303,6 +327,8 @@ impl Shell {
         let (backdrop,glass_blur)=(self.backdrop.as_ref().and_then(|b|b.color()),self.native.as_ref().is_some_and(|w|w.blur_active()));
         #[cfg(not(windows))]
         let (backdrop,glass_blur)=(None,false);
+        // 同一台罗技设备同时被系统蓝牙和接收器发现时，只保留信息更完整的接收器电量。
+        let bt=self.bt.iter().filter(|device|!self.peripherals.iter().any(|other|other.name.eq_ignore_ascii_case(&device.name))).cloned().collect();
         Env {
             t: self.t0.elapsed().as_secs_f64(),
             clock,
@@ -330,8 +356,10 @@ impl Shell {
             },
             media: self.media.lock().map(|m| m.clone()).unwrap_or_default(),
             volume: self.system_state.volume,
-            bt: self.bt.clone(),
+            bt,
             bt_ready: self.bt_ready,
+            peripherals: self.peripherals.clone(),
+            peripherals_ready: self.peripherals_ready,
             screen,
             backdrop,
             glass_blur,
@@ -339,6 +367,7 @@ impl Shell {
                 #[cfg(windows)] {self.native.as_ref().is_some_and(|w|w.opaque_surface())}
                 #[cfg(not(windows))] {false}
             },
+            performance,
         }
     }
 }
@@ -461,6 +490,23 @@ impl eframe::App for Shell {
                 }
             } else {
                 self.backdrop=None;
+            }
+            if self.app.module_on(app::LOGITECH_PAGE) {
+                if self.logitech_rx.is_none() {self.logitech_rx=Some(daozai::logitech::spawn());}
+            } else {
+                self.logitech_rx=None;
+                self.peripherals.clear();
+                self.peripherals_ready=false;
+                self.logitech_page_shown=false;
+            }
+            // 切到外设页时按需立即读一次，避免只等后台的每分钟兜底。
+            let logitech_shown=self.app.module_on(app::LOGITECH_PAGE) && self.app.page()==app::LOGITECH_PAGE;
+            if logitech_shown && !self.logitech_page_shown {
+                if let Some(service)=&self.logitech_rx {service.refresh();}
+            }
+            self.logitech_page_shown=logitech_shown;
+            if let Some(service)=&self.logitech_rx {
+                while let Ok(found)=service.rx.try_recv(){ self.peripherals=found; self.peripherals_ready=true; }
             }
             if self.app.settings.bluetooth_notifications {
                 if self.bt_rx.is_none() {self.bt_rx=Some(daozai::bt::spawn());}

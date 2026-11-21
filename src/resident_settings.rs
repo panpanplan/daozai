@@ -1,8 +1,8 @@
 use crate::{bar_layout::*,paint::{self,Card,H},theme::{self,W}};
 use eframe::egui::{self,Color32,RichText,Rect,Pos2,Vec2};
 
-pub(crate) fn preview_layout(order:&[usize],quotas:usize)->Layout {
-    let mut layout=Layout::new(true,quotas.max(1),true,true,false,true,true);
+pub(crate) fn preview_layout(order:&[usize],quotas:usize,perf:bool)->Layout {
+    let mut layout=Layout::with_perf(true,quotas.max(1),true,true,false,true,true,perf);
     layout.reorder(order);layout
 }
 
@@ -19,7 +19,7 @@ impl crate::app::App {
         ui.add_space(12.0);
         let indices=self.quota_bar_indices();let count=indices.len();
         let weather_snapshot=self.weather_pill().cloned();
-        let mut layout=preview_layout(&order,count);
+        let mut layout=preview_layout(&order,count,self.settings.show_performance);
         for (position,extra) in self.quota_balance_layout(ui.ctx()){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
         if self.settings.clock_seconds { layout.widen_clock(24.0); }
@@ -85,6 +85,10 @@ impl crate::app::App {
             }
             if is_dragged {ui.painter().line_segment([Pos2::new(rect.center().x,body.bottom()+6.0),Pos2::new(rect.center().x,body.bottom()+12.0)],egui::Stroke::new(2.0,theme::BLUE));}
             response.on_hover_text(label(slot));
+        }
+        // 固定的电脑状态徽标不参与拖动，预览里也占最后一格。
+        if let Some(x)=layout.x[PERF] {
+            card.ghost().text(cx+x,20.0,"CPU",10.0,W::Bold,theme::BLUE,H::Center);
         }
         if let Some(palette)=self.skin_palette() {
             let end=crate::skin_paint::shape_count(ui.ctx(),ui.layer_id());

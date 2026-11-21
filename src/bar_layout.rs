@@ -13,9 +13,12 @@ pub(crate) const MUSIC: usize = 6;
 pub(crate) const FOCUS: usize = 7;
 pub(crate) const BELL: usize = 8;
 pub(crate) const PET: usize = 9;
+/// 电脑状态徽标：固定在常驻栏末尾，不参与拖动排序。
+pub(crate) const PERF: usize = 10;
+pub(crate) const PERF_WIDTH: f32 = 52.0;
 /// 天气徽标的基础槽宽；温度文字更长时由 `widen` 补足。
 pub(crate) const WEATHER_WIDTH: f32 = 38.0;
-const WIDTHS: [f32; 10] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0];
+const WIDTHS: [f32; 11] = [44.0,20.0,27.0,27.0,27.0,WEATHER_WIDTH,14.0,crate::focus_bar::WIDTH,20.0,32.0,PERF_WIDTH];
 
 pub(crate) const DEFAULT_ORDER: [usize;7]=[BATTERY,PET,CLOCK,WEATHER,QUOTA,MUSIC,FOCUS];
 pub(crate) fn valid_order(order:&[usize])->bool {
@@ -44,7 +47,15 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
+    /// 保留原来的七参构造：现有调用与布局测试不感知新徽标。
     pub fn new(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool)->Self {
+        Self::build(battery,quotas,music,focus,bell,pet,weather,false)
+    }
+    /// 带电脑状态徽标的布局；徽标排在最后，不参与 `DEFAULT_ORDER` 拖动排序。
+    pub fn with_perf(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,perf:bool)->Self {
+        Self::build(battery,quotas,music,focus,bell,pet,weather,perf)
+    }
+    fn build(battery:bool,quotas:usize,music:bool,focus:bool,bell:bool,pet:bool,weather:bool,perf:bool)->Self {
         fn place(cursor:&mut f32,width:f32)->f32 {let x=*cursor+width/2.0;*cursor+=width+12.0;x}
         let mut widths=WIDTHS.to_vec(); widths.resize(WIDTHS.len()+quotas.saturating_sub(3),27.0);
         let mut x=vec![None;widths.len()];let mut cursor=16.0;
@@ -69,6 +80,7 @@ impl Layout {
         for (slot,on) in [(MUSIC,music&&!bell),(FOCUS,focus),(BELL,bell)] {
             if on {x[slot]=Some(place(&mut cursor,WIDTHS[slot]));}
         }
+        if perf {x[PERF]=Some(place(&mut cursor,WIDTHS[PERF]));}
         let width=cursor-12.0+16.0;
         for value in x.iter_mut().flatten() {*value-=width/2.0;}
         Self {width:width.max(96.0),x,widths,quotas}
@@ -92,7 +104,8 @@ impl Layout {
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
-        for slot in order.iter().copied().chain(std::iter::once(BELL)) {
+        // 电脑状态徽标固定在末尾；未启用时槽位为 None，会被跳过。
+        for slot in order.iter().copied().chain([BELL, PERF]) {
             let slots:Vec<usize>=if slot==QUOTA{self.quota_slots().collect()}else{vec![slot]};
             let left=slots.iter().filter_map(|&i|original[i].map(|x|x-self.widths[i]/2.0)).fold(f32::INFINITY,f32::min);
             let right=slots.iter().filter_map(|&i|original[i].map(|x|x+self.widths[i]/2.0)).fold(f32::NEG_INFINITY,f32::max);
@@ -122,7 +135,7 @@ pub(crate) struct Motion {
     initialized: bool,
 }
 impl Default for Motion {
-    fn default()->Self {Self {target:Layout::new(false,0,false,false,false,false,false),positions:vec![Spring::new(0.0,360.0,0.76);10],initialized:false}}
+    fn default()->Self {Self {target:Layout::new(false,0,false,false,false,false,false),positions:vec![Spring::new(0.0,360.0,0.76);11],initialized:false}}
 }
 impl Motion {
     pub fn step(&mut self,target:Layout,dt:f32,animate:bool) {
